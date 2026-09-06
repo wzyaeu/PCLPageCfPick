@@ -197,33 +197,31 @@ def parse_cf_rows(html):
     return rows
 
 
-def pick_min_by_line(rows):
+def collect_all_by_line(rows):
+    """按线路收集网页上该线路的全部优选IP, 每条线路内按 (延迟, IP) 升序排列"""
     by_line = {}
     for cn, ip, ms in rows:
         by_line.setdefault(cn, []).append((ms, ip))
     if not by_line:
         sys.exit("错误: 未解析到任何线路数据(页面结构可能已变化)")
-    order = sorted(by_line, key=lambda c: min(m for m, _ in by_line[c]))
-    used, result = set(), {}
-    for cn in order:
-        for ms, ip in sorted(by_line[cn]):
-            if ip not in used:
-                result[cn] = (ip, ms)
-                used.add(ip)
-                break
-        else:
-            print("警告: 线路 %s 的全部候选 IP 已被其它线路占用, 跳过" % cn)
-    return result
+    return {cn: sorted(lst) for cn, lst in by_line.items()}
 
 
 def online_pick_ip_map(url):
+    """抓取页面, 收集每个线路在网页上的全部优选IP, 返回 ({line: [IP,...]}, {cn: [(ms,ip)...]})"""
     html = fetch_cf_page(url)
     rows = parse_cf_rows(html)
     if not rows:
         sys.exit("错误: 页面中未解析到有效数据(页面结构可能已变化)")
-    print("[抓取] 共解析 %d 条候选行(电信/联通/移动)" % len(rows))
-    picked = pick_min_by_line(rows)
-    return {CN_LINE[cn]: ip for cn, (ip, _ms) in picked.items()}, picked
+    print("[抓取] 共解析 %d 条候选行(电信/联通/移动), 按线路收集全部如下:" % len(rows))
+    by = collect_all_by_line(rows)
+    ip_map = {}
+    for cn, items in by.items():
+        line = CN_LINE.get(cn, cn)
+        ip_map[line] = [ip for _ms, ip in items]
+        desc = ", ".join("%s(%dms)" % (ip, ms) for ms, ip in items)
+        print("  [%s line=%-7s] 共%d个: %s" % (cn, line, len(items), desc))
+    return ip_map, by
 
 
 def cmd_list(args):
@@ -243,12 +241,12 @@ def cmd_list(args):
 
 
 def load_ip_map(args):
+    """按来源返回 {线路line值: [IP, ...]}: --online 在线抓全量, 或 --map/--map-file 手动指定"""
     if args.online:
         if args.map or args.map_file:
             sys.exit("错误: --online 与 --map/--map-file 不可同时使用")
-        ip_map, picked = online_pick_ip_map(args.online)
-        for cn, (ip, ms) in picked.items():
-            print("  [选中] %s (line=%-7s) %-15s 延迟 %d ms" % (cn, CN_LINE.get(cn, ""), ip, ms))
+        print("[来源] 在线抓取微测网 CF 优选地址页: %s" % args.online)
+        ip_map, _by = online_pick_ip_map(args.online)
         return ip_map
     try:
         if args.map_file:
@@ -260,7 +258,8 @@ def load_ip_map(args):
             raise ValueError("映射需为 JSON 对象")
     except Exception as e:
         sys.exit("错误: 无法解析映射(可用 --map-file 指定 JSON 文件): %s" % e)
-    return ip_map
+    # 手动映射兼容 单IP字符串 与 IP列表 两种写法
+    return {k: (v if isinstance(v, list) else [v]) for k, v in ip_map.items()}
 
 
 def cmd_update(args):
@@ -270,31 +269,37 @@ def cmd_update(args):
     if zone is None:
         sys.exit("未找到公网 zone: %s" % ZONE_NAME)
     recordsets = list_a_records_with_line(client, zone)
-    matched = 0
+    matched = skipped = 0
     for r in recordsets:
         line = getattr(r, "line", None) or ""
-        if line in ip_map:
-            new_ip = ip_map[line]
-            old = ",".join(r.records or [])
-            if args.dry_run:
-                print("[预览] line=%-10s %-15s -> %-15s (不写入)" % (line, old, new_ip))
-            else:
-                body = UpdateRecordSetsReq(
-                    name=r.name,
-                    description=getattr(r, "description", "") or "",
-                    type=r.type,
-                    ttl=getattr(r, "ttl", None),
-                    records=[new_ip],
-                    weight=getattr(r, "weight", None),
-                )
-                client.update_record_sets(
-                    UpdateRecordSetsRequest(zone_id=zone.id, recordset_id=r.id, body=body)
-                )
-                print("[已更新] line=%-10s %-15s -> %-15s" % (line, old, new_ip))
-            matched += 1
-    if matched == 0:
-        print("警告: 未找到与 --map 匹配的记录。请先运行 list 查看实际 line 值。")
-    print("完成, 共处理 %d 条。" % matched)
+        if line not in ip_map:
+            continue
+        new_ips = ip_map[line]
+        old_ips = list(r.records or [])
+        new = ",".join(new_ips)
+        if old_ips == new_ips:
+            print("[无变化] line=%-8s 已是目标值: %s" % (line, new))
+            skipped += 1
+            continue
+        matched += 1
+        if args.dry_run:
+            print("[预览] line=%-8s %d个 -> %d个: %s (不写入)" % (line, len(old_ips), len(new_ips), new))
+        else:
+            body = UpdateRecordSetsReq(
+                name=r.name,
+                description=getattr(r, "description", "") or "",
+                type=r.type,
+                ttl=getattr(r, "ttl", None),
+                records=new_ips,
+                weight=getattr(r, "weight", None),
+            )
+            client.update_record_sets(
+                UpdateRecordSetsRequest(zone_id=zone.id, recordset_id=r.id, body=body)
+            )
+            print("[已更新] line=%-8s %d个 -> %d个: %s" % (line, len(old_ips), len(new_ips), new))
+    if matched == 0 and skipped == 0:
+        print("警告: 未找到与映射匹配的记录。请先运行 list 查看实际 line 值。")
+    print("完成: 更新 %d 条, 无变化跳过 %d 条。" % (matched, skipped))
 
 
 def main():
@@ -307,11 +312,11 @@ def main():
     p_list = sub.add_parser("list", help="查看 zone 与 cf-pick 各线路 A 记录")
     p_list.add_argument("--region", default=None, help="只探测指定区域, 如 ap-southeast-1")
 
-    p_up = sub.add_parser("update", help="更新 A 记录: 用 --online 联网优选, 或 --map/--map-file 手动指定(v2.2)")
+    p_up = sub.add_parser("update", help="更新 A 记录: 用 --online 联网优选, 或 --map/--map-file 手动指定(v2.3)")
     p_up.add_argument("--online", nargs="?", const=DEFAULT_CF_URL, default=None,
-                      metavar="URL", help="联网从微测网 CF 优选地址页按线路自动选延迟最小且互不重复的 IP"
+                      metavar="URL", help="联网抓取微测网 CF 优选地址页, 把该线路在网页上的全部优选 IP 写入记录集"
                                           "(可另给 URL 覆盖默认源)")
-    p_up.add_argument("--map", default=None, help='JSON 映射字符串, 例: {"Dianxin":"1.2.3.4"}')
+    p_up.add_argument("--map", default=None, help='JSON 映射字符串或数组, 例: {"Dianxin":["1.2.3.4","5.6.7.8"]}')
     p_up.add_argument("--map-file", default=None, help="含 JSON 映射的文件路径(推荐, 避免引号转义问题)")
     p_up.add_argument("--region", default=None)
     p_up.add_argument("--dry-run", action="store_true", help="只预览不写入")
