@@ -32,4 +32,4 @@ jobs:
         env:
           HUAWEICLOUD_SDK_AK: ${{ secrets.HUAWEICLOUD_SDK_AK }}
           HUAWEICLOUD_SDK_SK: ${{ secrets.HUAWEICLOUD_SDK_SK }}
-        run: python main.py
+        run: python huawei_cf_pick.py update --online
