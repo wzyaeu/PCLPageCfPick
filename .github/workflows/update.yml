@@ -30,7 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install huaweicloudsdkcore huaweicloudsdkiam huaweicloudsdkdns
 
-      - name: Run main.py
+      - name: Run huawei_cf_pick.py
         env:
           HUAWEICLOUD_SDK_AK: ${{ secrets.HUAWEICLOUD_SDK_AK }}
           HUAWEICLOUD_SDK_SK: ${{ secrets.HUAWEICLOUD_SDK_SK }}

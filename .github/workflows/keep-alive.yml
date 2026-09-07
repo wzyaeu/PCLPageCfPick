@@ -1,0 +1,27 @@
+name: 仓库保活
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  cancel-in-progress: false
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: keep-alive
+        shell: bash
+        run: |
+          git commit --allow-empty -m "仓库保活"
+          git pull --rebase --autostash origin "main" || true
+          git push origin "HEAD:main"
