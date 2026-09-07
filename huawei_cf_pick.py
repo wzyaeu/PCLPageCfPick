@@ -23,8 +23,18 @@ from huaweicloudsdkdns.v2.region.dns_region import DnsRegion
 ZONE_NAME = "kaphia.top"
 RECORD_NAME = "cf-pick.kaphia.top"
 
-DEFAULT_CF_URL = "https://www.wetest.vip/page/cloudflare/address_v4.html"
+DEFAULT_CF_URL = "https://stock.hostmonit.com/CloudFlareYes"
 CN_LINE = {"电信": "Dianxin", "联通": "Liantong", "移动": "Yidong"}
+
+# hostmonit 优选页数据并不内联在 HTML, 而是由页面 JS 携带 key 向后端接口取数。
+# 这里直接复刻页面 JS(CFYes-*.js) 的请求方式获取, 无需真实浏览器。
+HOSTMONIT_API_URL = "https://api.hostmonit.com/get_optimization_ip"
+HOSTMONIT_KEY = "iDetkOys"
+# hostmonit 线路编码: CM=中国移动, CU=中国联通, CT=中国电信
+HOSTMONIT_LINE = {"CM": "移动", "CU": "联通", "CT": "电信"}
+
+# 备用网页源(页面表格直接渲染在 HTML, 可直接解析)
+LEGACY_CF_URL = "https://www.wetest.vip/page/cloudflare/address_v4.html"
 FETCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -170,7 +180,7 @@ def _read_url(url):
     return raw.decode("utf-8", "ignore")
 
 
-def fetch_cf_page(url=DEFAULT_CF_URL):
+def fetch_cf_page(url=LEGACY_CF_URL):
     for attempt in range(1, 4):
         try:
             html = _read_url(url)
@@ -197,6 +207,87 @@ def parse_cf_rows(html):
     return rows
 
 
+def _post_json(url, payload):
+    """以页面 JS 同款方式 POST JSON, 返回解析后的对象"""
+    body = json.dumps(payload).encode("utf-8")
+    headers = dict(FETCH_HEADERS)
+    headers.update({
+        "Content-Type": "application/json;charset=UTF-8",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://stock.hostmonit.com",
+        "Referer": "https://stock.hostmonit.com/CloudFlareYes",
+    })
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+    if enc == "gzip":
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8", "ignore"))
+
+
+def extract_hostmonit_key():
+    """改版容错: 页面 HTML -> app-*.js -> CFYes-*.js 组件 chunk, 从其中解析当前 key"""
+    try:
+        html = _read_url(DEFAULT_CF_URL)
+        m = re.search(r"assets/(app-[A-Za-z0-9_.-]+\.js)", html)
+        if not m:
+            return None
+        js = _read_url("https://stock.hostmonit.com/" + m.group(1))
+        m2 = re.search(r"(CFYes-[A-Za-z0-9_.-]+\.js)", js)
+        if not m2:
+            return None
+        cjs = _read_url("https://stock.hostmonit.com/assets/" + m2.group(1))
+        i = cjs.find(HOSTMONIT_API_URL)
+        if i < 0:
+            i = cjs.find("get_optimization_ip")
+        if i < 0:
+            return None
+        m3 = re.search(r'key\s*[:=]\s*["\']([^"\']+)["\']', cjs[max(0, i - 300):i + 100])
+        return m3.group(1) if m3 else None
+    except Exception:
+        return None
+
+
+def parse_hostmonit_info(info):
+    """接口 info 项 -> [(中文线路, ip, 延迟ms), ...], 仅保留三网线路"""
+    rows = []
+    for it in info or []:
+        if not isinstance(it, dict):
+            continue
+        cn = HOSTMONIT_LINE.get(str(it.get("line") or "").strip().upper())
+        ip = str(it.get("ip") or "").strip()
+        ms = it.get("latency")
+        if cn and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip) and isinstance(ms, (int, float)):
+            rows.append((cn, ip, int(ms)))
+    return rows
+
+
+def fetch_hostmonit_rows():
+    """按页面 JS 同款方式请求 hostmonit 数据接口, 返回 [(中文线路, ip, 延迟ms), ...]"""
+    last_err = "未知错误"
+    keys = [HOSTMONIT_KEY]
+    dynamic = extract_hostmonit_key()
+    if dynamic:
+        print("[抓取] 已解析页面 JS, 当前 key=%s" % dynamic)
+        if dynamic not in keys:
+            keys.append(dynamic)
+    for attempt in range(1, 4):
+        key = keys[min(attempt - 1, len(keys) - 1)]
+        try:
+            data = _post_json(HOSTMONIT_API_URL, {"key": key})
+            info = data.get("info") if isinstance(data, dict) else None
+            rows = parse_hostmonit_info(info)
+            if rows:
+                return rows
+            last_err = "接口返回无有效数据: %s" % (str(data)[:200])
+        except Exception as e:
+            last_err = str(e)
+        print("提示: 第 %d 次获取失败(%s), 重试..." % (attempt, last_err))
+        time.sleep(1)
+    sys.exit("错误: hostmonit 数据获取失败: %s" % last_err)
+
+
 def collect_all_by_line(rows):
     """按线路收集网页上该线路的全部优选IP, 每条线路内按 (延迟, IP) 升序排列"""
     by_line = {}
@@ -208,12 +299,17 @@ def collect_all_by_line(rows):
 
 
 def online_pick_ip_map(url):
-    """抓取页面, 收集每个线路在网页上的全部优选IP, 返回 ({line: [IP,...]}, {cn: [(ms,ip)...]})"""
-    html = fetch_cf_page(url)
-    rows = parse_cf_rows(html)
-    if not rows:
-        sys.exit("错误: 页面中未解析到有效数据(页面结构可能已变化)")
-    print("[抓取] 共解析 %d 条候选行(电信/联通/移动), 按线路收集全部如下:" % len(rows))
+    """抓取数据源: hostmonit 走其 JSON 接口(复刻页面 JS 请求), 其它 URL 走 HTML 表格解析;
+    返回 ({line: [IP,...]}, {cn: [(ms,ip)...]})"""
+    if "hostmonit.com" in url:
+        rows = fetch_hostmonit_rows()
+        print("[抓取] 共解析 %d 条优选结果(移动/联通/电信各若干):" % len(rows))
+    else:
+        html = fetch_cf_page(url)
+        rows = parse_cf_rows(html)
+        if not rows:
+            sys.exit("错误: 页面中未解析到有效数据(页面结构可能已变化)")
+        print("[抓取] 共解析 %d 条候选行(电信/联通/移动), 按线路收集全部如下:" % len(rows))
     by = collect_all_by_line(rows)
     ip_map = {}
     for cn, items in by.items():
@@ -245,7 +341,7 @@ def load_ip_map(args):
     if args.online:
         if args.map or args.map_file:
             sys.exit("错误: --online 与 --map/--map-file 不可同时使用")
-        print("[来源] 在线抓取微测网 CF 优选地址页: %s" % args.online)
+        print("[来源] 在线抓取 CF 优选数据源: %s" % args.online)
         ip_map, _by = online_pick_ip_map(args.online)
         return ip_map
     try:
@@ -312,10 +408,10 @@ def main():
     p_list = sub.add_parser("list", help="查看 zone 与 cf-pick 各线路 A 记录")
     p_list.add_argument("--region", default=None, help="只探测指定区域, 如 ap-southeast-1")
 
-    p_up = sub.add_parser("update", help="更新 A 记录: 用 --online 联网优选, 或 --map/--map-file 手动指定(v2.3)")
+    p_up = sub.add_parser("update", help="更新 A 记录: 用 --online 联网优选, 或 --map/--map-file 手动指定")
     p_up.add_argument("--online", nargs="?", const=DEFAULT_CF_URL, default=None,
-                      metavar="URL", help="联网抓取微测网 CF 优选地址页, 把该线路在网页上的全部优选 IP 写入记录集"
-                                          "(可另给 URL 覆盖默认源)")
+                      metavar="URL", help="联网抓取 CF 优选地址(默认 hostmonit 优选页, 其数据需模拟页面 JS 请求后端接口获取;"
+                                          "可另给 URL 覆盖默认源, 如微测网表格页)")
     p_up.add_argument("--map", default=None, help='JSON 映射字符串或数组, 例: {"Dianxin":["1.2.3.4","5.6.7.8"]}')
     p_up.add_argument("--map-file", default=None, help="含 JSON 映射的文件路径(推荐, 避免引号转义问题)")
     p_up.add_argument("--region", default=None)
@@ -327,7 +423,7 @@ def main():
         print("用法示例:")
         print("  python huawei_cf_pick.py list                            # 查看当前各线路 A 记录值")
         print("  python huawei_cf_pick.py update --online --dry-run       # 联网优选并预览(不写入)")
-        print("  python huawei_cf_pick.py update --online                  # 联网优选并更新 DNS")
+        print("  v                  # 联网优选并更新 DNS")
         print("  python huawei_cf_pick.py update --map-file ip_update_map.json --dry-run  # 手动映射预览")
         print("  python huawei_cf_pick.py update --map '{\"Dianxin\":\"1.2.3.4\"}' -h       # 查看参数")
         sys.exit(0)
